@@ -23,6 +23,8 @@ from app.services.oven_engine import (
 
 api_router = APIRouter()
 
+PHASE_LABELS = {"ferment": "发酵", "bake": "烘烤"}
+
 
 def _recipe(p: Product) -> RecipeDurations:
     return RecipeDurations(p.ferment_min, p.bake_min)
@@ -87,18 +89,32 @@ def create_batch(body: BatchCreate, db: Session = Depends(get_db)):
         raise HTTPException(404, "产品或炉位不存在")
     recipe = _recipe(product)
     candidates = build_occupancies(oven.id, -1, body.start_min, recipe)
+    # 以提交这一刻库里的占炉为准重新计算，不采用页面打开时看到的空档
     existing = _all_occupancies(db)
     hits = find_conflicts(existing, candidates)
     code = body.code or f"BO-{body.start_min}"
     if hits:
         ex, cand = hits[0]
-        detail = (
-            f"与批次#{ex.batch_id} 的 {ex.phase} 段重叠："
+        opponent = db.get(Batch, ex.batch_id)
+        opponent_code = opponent.code if opponent else f"#{ex.batch_id}"
+        phase_label = PHASE_LABELS.get(ex.phase, ex.phase)
+        message = (
+            f"与批次 {opponent_code} 的{phase_label}段重叠："
             f"[{cand.interval.start},{cand.interval.end})"
         )
-        db.add(ConflictLog(batch_code=code, oven_id=oven.id, detail=detail))
+        db.add(ConflictLog(batch_code=code, oven_id=oven.id, detail=message))
         db.commit()
-        raise HTTPException(409, detail)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": message,
+                "opponent_batch_id": ex.batch_id,
+                "opponent_code": opponent_code,
+                "phase": ex.phase,
+                "phase_label": phase_label,
+                "interval": [cand.interval.start, cand.interval.end],
+            },
+        )
     batch = Batch(
         product_id=product.id,
         oven_id=oven.id,
@@ -145,11 +161,13 @@ def windows(product_id: int, db: Session = Depends(get_db)):
     if not product:
         raise HTTPException(404, "产品不存在")
     duration = product.ferment_min + product.bake_min
+    # 只读试算：建议本身不落库、不单独占炉
     existing = _all_occupancies(db)
     out: list[WindowOut] = []
     for oven in db.scalars(select(Oven).order_by(Oven.id)).all():
         w = next_free_window(existing, oven.id, duration, search_from=8 * 60, search_to=22 * 60)
         if w:
+            ferment_end = w.start + product.ferment_min
             out.append(
                 WindowOut(
                     oven_id=oven.id,
@@ -157,6 +175,8 @@ def windows(product_id: int, db: Session = Depends(get_db)):
                     start_min=w.start,
                     end_min=w.end,
                     duration_min=duration,
+                    ferment_end=ferment_end,
+                    bake_end=ferment_end + product.bake_min,
                 )
             )
     return out

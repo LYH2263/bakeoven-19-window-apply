@@ -63,3 +63,5 @@ class WindowOut(BaseModel):
     start_min: int
     end_min: int
     duration_min: int
+    ferment_end: int
+    bake_end: int

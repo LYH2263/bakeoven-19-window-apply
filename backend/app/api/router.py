@@ -23,6 +23,8 @@ from app.services.oven_engine import (
 
 api_router = APIRouter()
 
+PHASE_LABELS = {"ferment": "发酵", "bake": "烘烤"}
+
 
 def _recipe(p: Product) -> RecipeDurations:
     return RecipeDurations(p.ferment_min, p.bake_min)
@@ -79,6 +81,16 @@ def batches(db: Session = Depends(get_db)):
     return [_batch_out(db, b) for b in rows]
 
 
+def _next_code(db: Session, start_min: int) -> str:
+    base = f"BO-{start_min // 60:02d}{start_min % 60:02d}"
+    code = base
+    n = 2
+    while db.scalar(select(Batch.id).where(Batch.code == code)):
+        code = f"{base}-{n}"
+        n += 1
+    return code
+
+
 @api_router.post("/batches", response_model=BatchOut)
 def create_batch(body: BatchCreate, db: Session = Depends(get_db)):
     product = db.get(Product, body.product_id)
@@ -87,13 +99,18 @@ def create_batch(body: BatchCreate, db: Session = Depends(get_db)):
         raise HTTPException(404, "产品或炉位不存在")
     recipe = _recipe(product)
     candidates = build_occupancies(oven.id, -1, body.start_min, recipe)
+    # 以提交时刻库里的占炉为准重新计算，不信页面打开时看到的空档
     existing = _all_occupancies(db)
     hits = find_conflicts(existing, candidates)
-    code = body.code or f"BO-{body.start_min}"
+    code = body.code or _next_code(db, body.start_min)
+    if body.code and db.scalar(select(Batch.id).where(Batch.code == body.code)):
+        raise HTTPException(409, f"批次号 {body.code} 已存在")
     if hits:
         ex, cand = hits[0]
+        rival = db.get(Batch, ex.batch_id)
+        rival_code = rival.code if rival else f"#{ex.batch_id}"
         detail = (
-            f"与批次#{ex.batch_id} 的 {ex.phase} 段重叠："
+            f"与批次 {rival_code} 的{PHASE_LABELS.get(ex.phase, ex.phase)}段重叠："
             f"[{cand.interval.start},{cand.interval.end})"
         )
         db.add(ConflictLog(batch_code=code, oven_id=oven.id, detail=detail))
@@ -157,6 +174,8 @@ def windows(product_id: int, db: Session = Depends(get_db)):
                     start_min=w.start,
                     end_min=w.end,
                     duration_min=duration,
+                    ferment_end=w.start + product.ferment_min,
+                    bake_end=w.start + duration,
                 )
             )
     return out
